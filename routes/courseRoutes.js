@@ -17,122 +17,191 @@ router.get('/all-courses', async (req, res) => {
   }
 });
 
-// Protected Route: Create Course (Teachers Only)
+// create course
 router.post(
   '/create-course',
   verifyToken,
   upload.any(),
   async (req, res) => {
     try {
+      // Check if user is a teacher
       if (req.user.role !== 'teacher') {
         return res.status(403).json({ message: 'Only teachers can create courses' });
       }
 
-      const { title, description, teacherId } = req.body;
+      console.log('Request body:', req.body);
+      console.log('Files:', req.files);
+
+      // Extract and validate top-level course fields
+      const { title, description, teacherId, modules: rawModules } = req.body;
       if (!title || !description || !teacherId) {
         return res.status(400).json({ message: 'Title, description, and teacher ID are required' });
       }
 
-      // Step 1: Build a lookup table of files
+      if (!rawModules || !Array.isArray(rawModules) || rawModules.length === 0) {
+        return res.status(400).json({ message: 'At least one module is required' });
+      }
+
+      // Build a lookup table of files
       const fileMap = {};
       (req.files || []).forEach((file) => {
         fileMap[file.fieldname] = file;
       });
 
+      // Process modules
       const modules = [];
-      let modIndex = 0;
 
-      while (req.body[`modules[${modIndex}][moduleTitle]`]) {
-        const moduleTitle = req.body[`modules[${modIndex}][moduleTitle]`];
-        const moduleDescription = req.body[`modules[${modIndex}][moduleDescription]`];
+      for (let modIndex = 0; modIndex < rawModules.length; modIndex++) {
+        const rawModule = rawModules[modIndex];
+        
+        if (!rawModule.moduleTitle || !rawModule.moduleDescription) {
+          return res.status(400).json({ 
+            message: `Module ${modIndex + 1} missing title or description` 
+          });
+        }
+
         const module = {
-          moduleTitle,
-          moduleDescription,
+          title: rawModule.moduleTitle,
           videos: [],
           documents: [],
-          assignment: null,
-          quiz: [],
+          quiz: { questions: [] },
+          assignmentSubmissions: [],
         };
 
-        // Extract videos
-        let vidIndex = 0;
-        while (req.body[`modules[${modIndex}][videos][${vidIndex}][title]`]) {
-          const title = req.body[`modules[${modIndex}][videos][${vidIndex}][title]`];
-          const fileField = `modules[${modIndex}][videos][${vidIndex}][file]`;
-          const file = fileMap[fileField];
+        // Process videos
+        if (rawModule.videos && Array.isArray(rawModule.videos)) {
+          for (let vidIndex = 0; vidIndex < rawModule.videos.length; vidIndex++) {
+            const video = rawModule.videos[vidIndex];
+            
+            if (!video.title) {
+              return res.status(400).json({ 
+                message: `Video ${vidIndex + 1} in module ${modIndex + 1} missing title` 
+              });
+            }
 
-          if (file) {
+            // Look for the video file in the uploaded files
+            const fileField = `modules[${modIndex}][videos][${vidIndex}][file]`;
+            const file = fileMap[fileField];
+
+            if (!file) {
+              return res.status(400).json({ 
+                message: `Video ${vidIndex + 1} in module ${modIndex + 1} missing file` 
+              });
+            }
+
             module.videos.push({
-              title,
+              title: video.title,
               videoUrl: `/uploads/${file.filename}`,
               thumbnailUrl: '',
+              assignment: null,
             });
           }
-
-          vidIndex++;
         }
 
-        // Extract documents
-        let docIndex = 0;
-        while (fileMap[`modules[${modIndex}][documents][${docIndex}]`]) {
-          const file = fileMap[`modules[${modIndex}][documents][${docIndex}]`];
-          module.documents.push({
-            name: file.originalname,
-            fileUrl: `/uploads/${file.filename}`,
-          });
-          docIndex++;
-        }
-
-        // Assignment
-        const assignFile = fileMap[`modules[${modIndex}][assignment]`];
-        if (assignFile) {
-          module.assignment = {
-            name: assignFile.originalname,
-            fileUrl: `/uploads/${assignFile.filename}`,
-          };
-        }
-
-        // Quiz
-        const quizRaw = req.body[`modules[${modIndex}][quiz]`];
-        if (quizRaw) {
-          try {
-            module.quiz = JSON.parse(quizRaw);
-          } catch (err) {
-            console.warn(`Invalid quiz data in module ${modIndex}:`, err);
-            module.quiz = [];
+        // Process documents
+        if (rawModule.documents && Array.isArray(rawModule.documents)) {
+          for (let docIndex = 0; docIndex < rawModule.documents.length; docIndex++) {
+            const fileField = `modules[${modIndex}][documents][${docIndex}]`;
+            const file = fileMap[fileField];
+            
+            if (file) {
+              module.documents.push({
+                name: file.originalname,
+                fileUrl: `/uploads/${file.filename}`,
+              });
+            }
           }
+        }
+
+        // Process quiz
+        if (rawModule.quiz) {
+          try {
+            let quizData;
+            
+            // Parse quiz data if it's a string
+            if (typeof rawModule.quiz === 'string') {
+              quizData = JSON.parse(rawModule.quiz);
+            } else {
+              quizData = rawModule.quiz;
+            }
+
+            if (Array.isArray(quizData)) {
+              // Filter out empty/invalid questions
+              const validQuestions = quizData.filter(q => 
+                q.question && 
+                q.question.trim() && 
+                Array.isArray(q.options) && 
+                q.options.some(opt => opt && opt.trim()) &&
+                typeof q.correctAnswer === 'number'
+              );
+
+              module.quiz.questions = validQuestions.map((q, i) => {
+                // Validate question structure
+                if (!q.question || !Array.isArray(q.options) || q.options.length === 0) {
+                  throw new Error(`Invalid quiz question ${i + 1} in module ${modIndex + 1}: Missing question or options`);
+                }
+                if (!Number.isInteger(q.correctAnswer) || q.correctAnswer < 0 || q.correctAnswer >= q.options.length) {
+                  throw new Error(`Invalid correctAnswer in question ${i + 1} of module ${modIndex + 1}: Must be a valid index (0-${q.options.length - 1})`);
+                }
+
+                return {
+                  questionText: q.question,
+                  options: q.options,
+                  correctAnswerIndex: q.correctAnswer,
+                };
+              });
+            }
+          } catch (err) {
+            console.warn(`Quiz parsing error in module ${modIndex + 1}:`, err.message);
+            // Continue with empty quiz if parsing fails
+          }
+        }
+
+        // Validate that module has at least one video
+        if (module.videos.length === 0) {
+          return res.status(400).json({ 
+            message: `Module ${modIndex + 1} must have at least one video` 
+          });
         }
 
         modules.push(module);
-        modIndex++;
       }
 
-      console.log('Modules:', {
-        title,
-        description,
-        teacherId,
-        modules,
-        createdBy: req.user.userId,
-      });
-
+      // Create and save the course
       const newCourse = new Course({
         title,
         description,
-        teacherId,
-        modules,
         createdBy: req.user.userId,
+        modules,
       });
 
       await newCourse.save();
-      res.status(201).json({ success: true, course: newCourse });
-
+      
+      console.log('Course created successfully:', newCourse._id);
+      res.status(201).json({ 
+        success: true, 
+        message: 'Course created successfully!',
+        course: newCourse 
+      });
     } catch (err) {
-      console.error('Upload error:', err);
-      res.status(500).json({ success: false, error: 'Server error' });
+      console.error('Course creation error:', err);
+      
+      // Send more specific error messages
+      if (err.message.includes('Module') || err.message.includes('Video') || err.message.includes('quiz')) {
+        return res.status(400).json({ 
+          success: false, 
+          message: err.message 
+        });
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        message: 'Server error while creating course',
+        error: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
+      });
     }
   }
 );
-
 
 // ✅ Update Course
 router.put(
